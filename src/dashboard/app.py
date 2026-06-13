@@ -16,12 +16,27 @@ try:
     import plotly.graph_objects as go
     from streamlit_webrtc import webrtc_streamer, RTCConfiguration
     from src.inference.realtime import WebRTCVideoProcessor
+    import streamlit_webrtc.shutdown
     HAS_STREAMLIT = True
 except ImportError:
     HAS_STREAMLIT = False
     webrtc_streamer = None
     RTCConfiguration = None
     WebRTCVideoProcessor = None
+
+# Monkey patch streamlit-webrtc SessionShutdownObserver to fix race condition crash
+if HAS_STREAMLIT:
+    try:
+        def safe_stop(self, timeout: float = 1.0) -> None:
+            polling_thread = self._polling_thread
+            if polling_thread:
+                self._polling_thread_stop_event.set()
+                if threading.current_thread() is not polling_thread:
+                    polling_thread.join(timeout=timeout)
+                self._polling_thread = None
+        streamlit_webrtc.shutdown.SessionShutdownObserver.stop = safe_stop
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -142,8 +157,8 @@ def run_app():
         st.markdown('---')
 
         col_start, col_stop = st.columns(2)
-        start_btn = col_start.button('▶️ Start', use_container_width=True)
-        stop_btn = col_stop.button('⏹ Stop', use_container_width=True)
+        start_btn = col_start.button('▶️ Start', width='stretch')
+        stop_btn = col_stop.button('⏹ Stop', width='stretch')
 
         camera_id = st.number_input('Camera ID', min_value=0, max_value=5, value=0, step=1,
                                     help='OpenCV camera index (0 for built-in, 1+ for external)')
@@ -165,16 +180,16 @@ def run_app():
         st.session_state.session_start = time.time()
 
         # Force-reload modules to apply code updates without restarting the Streamlit server
-        import importlib
-        import src.models.cusum
-        import src.extraction.face_mesh
-        import src.explainability.attribution
-        import src.inference.realtime
+        # import importlib
+        # import src.models.cusum
+        # import src.extraction.face_mesh
+        # import src.explainability.attribution
+        # import src.inference.realtime
         
-        importlib.reload(src.models.cusum)
-        importlib.reload(src.extraction.face_mesh)
-        importlib.reload(src.explainability.attribution)
-        importlib.reload(src.inference.realtime)
+        # importlib.reload(src.models.cusum)
+        # importlib.reload(src.extraction.face_mesh)
+        # importlib.reload(src.explainability.attribution)
+        # importlib.reload(src.inference.realtime)
         
         from src.inference.realtime import start_pipeline
         from src.models.cusum import CUSUMDetector
@@ -346,7 +361,7 @@ def run_app():
             height=130, margin=dict(l=10, r=10, t=5, b=5),
             paper_bgcolor='rgba(0,0,0,0)', font_color='#ecf0f1',
         )
-        gauge_placeholder.plotly_chart(fig_gauge, use_container_width=True, key=f"gauge_chart_{n_points}_{time.time()}")
+        gauge_placeholder.plotly_chart(fig_gauge, width='stretch', key=f"gauge_chart_{n_points}_{time.time()}")
 
         # 2. Update Metrics Row
         status_str = score_label(score)
@@ -452,7 +467,7 @@ def run_app():
                 legend=dict(orientation='h', yanchor='top', y=-0.3, xanchor='center', x=0.5),
             )
 
-            chart_placeholder.plotly_chart(fig_trend, use_container_width=True, key=f"trend_chart_{n_points}_{time.time()}")
+            chart_placeholder.plotly_chart(fig_trend, width='stretch', key=f"trend_chart_{n_points}_{time.time()}")
         else:
             chart_placeholder.info('Session drift trajectory will appear once enough windows are processed.')
 
@@ -615,78 +630,101 @@ def run_app():
         # Pre-render placeholders with current values immediately when active session starts
         render_placeholders(current_score, current_conf, current_alert, n_points)
 
-        # Loop until session deactivated
-        while st.session_state.session_active:
-            # 1. Update Video Frame from queue (Simulation Mode only)
-            if simulate and st.session_state.video_queue is not None:
+        # Set initial status banner in WebRTC mode if not playing yet
+        if not simulate:
+            if 'webrtc_ctx' in locals() and webrtc_ctx is not None:
+                if not webrtc_ctx.state.playing:
+                    status_banner_placeholder.markdown(
+                        '<div class="connection-status" style="background: rgba(241, 196, 15, 0.1); border: 1px solid rgba(241, 196, 15, 0.3); color: #f1c40f;">'
+                        '🔄 Connecting to WebRTC webcam stream... (Accept browser camera prompts)'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+
+        # Determine if we should enter the real-time polling loop
+        should_run_loop = True
+        if not simulate:
+            if 'webrtc_ctx' not in locals() or webrtc_ctx is None or not webrtc_ctx.state.playing:
+                should_run_loop = False
+
+        if should_run_loop:
+            # Loop until session deactivated
+            while st.session_state.session_active:
+                # 1. Update Video Frame from queue (Simulation Mode only)
+                if simulate and st.session_state.video_queue is not None:
+                    try:
+                        frame = st.session_state.video_queue.get_nowait()
+                        video_placeholder.image(frame, channels="BGR", width="stretch")
+                    except queue.Empty:
+                        pass
+
+                # Exit loop if WebRTC stops playing
+                if not simulate:
+                    if 'webrtc_ctx' not in locals() or webrtc_ctx is None or not webrtc_ctx.state.playing:
+                        break
+
+                # 2. Check for new score metrics from model pipeline
+                new_score_received = False
                 try:
-                    frame = st.session_state.video_queue.get_nowait()
-                    video_placeholder.image(frame, channels="BGR", width="stretch")
+                    while True:
+                        data = st.session_state.score_queue.get_nowait()
+                        elapsed = data['timestamp'] - st.session_state.session_start
+                        st.session_state.score_history.append(data['score'])
+                        st.session_state.time_history.append(elapsed)
+                        st.session_state.confidence_history.append(data['confidence'])
+                        st.session_state.alert_history.append(data['alert'])
+                        st.session_state.attributions_history.append(data.get('attributions', []))
+                        
+                        current_score = data['score']
+                        current_conf = data['confidence']
+                        current_alert = data['alert']
+                        n_points = len(st.session_state.score_history)
+                        new_score_received = True
                 except queue.Empty:
                     pass
 
-            # 2. Check for new score metrics from model pipeline
-            new_score_received = False
-            try:
-                while True:
-                    data = st.session_state.score_queue.get_nowait()
-                    elapsed = data['timestamp'] - st.session_state.session_start
-                    st.session_state.score_history.append(data['score'])
-                    st.session_state.time_history.append(elapsed)
-                    st.session_state.confidence_history.append(data['confidence'])
-                    st.session_state.alert_history.append(data['alert'])
-                    st.session_state.attributions_history.append(data.get('attributions', []))
-                    
-                    current_score = data['score']
-                    current_conf = data['confidence']
-                    current_alert = data['alert']
-                    n_points = len(st.session_state.score_history)
-                    new_score_received = True
-            except queue.Empty:
-                pass
+                # 3. Re-render Plotly/HTML widgets in place if score changed
+                if new_score_received:
+                    render_placeholders(current_score, current_conf, current_alert, n_points)
 
-            # 3. Re-render Plotly/HTML widgets in place if score changed
-            if new_score_received:
-                render_placeholders(current_score, current_conf, current_alert, n_points)
-
-            # 4. Check camera vs simulation status and update banner
-            if st.session_state.get('capture_thread') is not None or not simulate:
-                cap_thread = st.session_state.capture_thread
-                if cap_thread is not None and cap_thread.simulate and not simulate:
-                    status_banner_placeholder.markdown(
-                        '<div class="connection-status" style="background: rgba(231, 76, 60, 0.1); border: 1px solid rgba(231, 76, 60, 0.3); color: #ff6b6b;">'
-                        f'⚠️ CAMERA INITIALIZATION FAILED! Fell back to Simulation Mode (Camera ID: {camera_id})'
-                        '</div>',
-                        unsafe_allow_html=True
-                    )
-                elif simulate:
-                    status_banner_placeholder.markdown(
-                        '<div class="connection-status" style="background: rgba(241, 196, 15, 0.1); border: 1px solid rgba(241, 196, 15, 0.3); color: #f1c40f;">'
-                        f'ℹ️ Running in Simulation Mode (Generating coherent driver sleepiness profiles)'
-                        '</div>',
-                        unsafe_allow_html=True
-                    )
-                else:
-                    if n_points < 6:
+                # 4. Check camera vs simulation status and update banner
+                if st.session_state.get('capture_thread') is not None or not simulate:
+                    cap_thread = st.session_state.capture_thread
+                    if cap_thread is not None and cap_thread.simulate and not simulate:
                         status_banner_placeholder.markdown(
-                            f'<div class="connection-status" style="background: rgba(241, 196, 15, 0.1); border: 1px solid rgba(241, 196, 15, 0.3); color: #f1c40f;">'
-                            f'🔄 CALIBRATING PERSONAL BASELINE... {n_points * 5}/30 seconds (Keep a neutral, alert face)'
+                            '<div class="connection-status" style="background: rgba(231, 76, 60, 0.1); border: 1px solid rgba(231, 76, 60, 0.3); color: #ff6b6b;">'
+                            f'⚠️ CAMERA INITIALIZATION FAILED! Fell back to Simulation Mode (Camera ID: {camera_id})'
+                            '</div>',
+                            unsafe_allow_html=True
+                        )
+                    elif simulate:
+                        status_banner_placeholder.markdown(
+                            '<div class="connection-status" style="background: rgba(241, 196, 15, 0.1); border: 1px solid rgba(241, 196, 15, 0.3); color: #f1c40f;">'
+                            f'ℹ️ Running in Simulation Mode (Generating coherent driver sleepiness profiles)'
                             '</div>',
                             unsafe_allow_html=True
                         )
                     else:
-                        if not st.session_state.calibration_toast_shown:
-                            st.toast("Personalized calibration complete! Monitoring active. 🎯")
-                            st.session_state.calibration_toast_shown = True
-                        status_banner_placeholder.markdown(
-                            '<div class="connection-status" style="background: rgba(46, 204, 113, 0.1); border: 1px solid rgba(46, 204, 113, 0.3); color: #2ecc71;">'
-                            f'🟢 Real-time WebRTC Webcam Active • Personalized Calibration Active'
-                            '</div>',
-                            unsafe_allow_html=True
-                        )
+                        if n_points < 6:
+                            status_banner_placeholder.markdown(
+                                f'<div class="connection-status" style="background: rgba(241, 196, 15, 0.1); border: 1px solid rgba(241, 196, 15, 0.3); color: #f1c40f;">'
+                                f'🔄 CALIBRATING PERSONAL BASELINE... {n_points * 5}/30 seconds (Keep a neutral, alert face)'
+                                '</div>',
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            if not st.session_state.calibration_toast_shown:
+                                st.toast("Personalized calibration complete! Monitoring active. 🎯")
+                                st.session_state.calibration_toast_shown = True
+                            status_banner_placeholder.markdown(
+                                '<div class="connection-status" style="background: rgba(46, 204, 113, 0.1); border: 1px solid rgba(46, 204, 113, 0.3); color: #2ecc71;">'
+                                f'🟢 Real-time WebRTC Webcam Active • Personalized Calibration Active'
+                                '</div>',
+                                unsafe_allow_html=True
+                            )
 
-            # Control polling/streaming frequency (~30 FPS)
-            time.sleep(0.03)
+                # Control polling/streaming frequency (~30 FPS)
+                time.sleep(0.03)
 
 
 if __name__ == '__main__':

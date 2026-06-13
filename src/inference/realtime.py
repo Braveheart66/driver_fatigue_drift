@@ -29,13 +29,16 @@ class WebRTCVideoProcessor(VideoProcessorBase):
 
     def __init__(self):
         self.raw_features_queue = None
-        # Lazy load extractor inside the WebRTC thread to avoid locks
-        from src.extraction.face_mesh import FaceMeshExtractor
-        self.extractor = FaceMeshExtractor()
+        self.extractor = None
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         if av is None:
             return frame
+
+        if self.extractor is None:
+            from src.extraction.face_mesh import FaceMeshExtractor
+            self.extractor = FaceMeshExtractor()
+
         img = frame.to_ndarray(format="bgr24")
 
         try:
