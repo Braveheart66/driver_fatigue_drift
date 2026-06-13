@@ -19,3 +19,5 @@ onnxruntime
 jupyter
 pytest
 black
+streamlit-webrtc
+av

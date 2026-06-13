@@ -14,9 +14,14 @@ import queue
 try:
     import streamlit as st
     import plotly.graph_objects as go
+    from streamlit_webrtc import webrtc_streamer, RTCConfiguration
+    from src.inference.realtime import WebRTCVideoProcessor
     HAS_STREAMLIT = True
 except ImportError:
     HAS_STREAMLIT = False
+    webrtc_streamer = None
+    RTCConfiguration = None
+    WebRTCVideoProcessor = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -222,13 +227,17 @@ def run_app():
             drift_model = DriftModel()
             
         st.session_state.video_queue = queue.Queue(maxsize=10)
+        st.session_state.raw_features_queue = queue.Queue(maxsize=100) if not simulate else None
+        
         stop_event, score_q, cap, ext, inf = start_pipeline(
             simulate=simulate,
             camera_id=int(camera_id),
             encoder=encoder,
             drift_model=drift_model,
             cusum=CUSUMDetector(),
-            video_queue=st.session_state.video_queue
+            video_queue=st.session_state.video_queue if simulate else None,
+            webrtc_mode=not simulate,
+            raw_features_queue=st.session_state.raw_features_queue
         )
         st.session_state.pipeline_stop = stop_event
         st.session_state.score_queue = score_q
@@ -457,14 +466,27 @@ def run_app():
     current_alert = st.session_state.alert_history[-1] if st.session_state.alert_history else 'STABLE'
     n_points = len(st.session_state.score_history)
 
-    # Set offline webcam image
-    offline_img = np.zeros((240, 320, 3), dtype=np.uint8) + 20
-    import cv2
-    cv2.putText(offline_img, "CAMERA OFFLINE", (45, 115),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 110, 120), 2)
-    cv2.putText(offline_img, "Click Start to activate feed", (35, 145),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 90, 100), 1)
-    video_placeholder.image(offline_img, channels="BGR", width="stretch")
+    # Set offline webcam image or render active WebRTC streamer
+    if not st.session_state.session_active or simulate:
+        offline_img = np.zeros((240, 320, 3), dtype=np.uint8) + 20
+        import cv2
+        cv2.putText(offline_img, "CAMERA OFFLINE", (45, 115),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 110, 120), 2)
+        cv2.putText(offline_img, "Click Start to activate feed", (35, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 90, 100), 1)
+        video_placeholder.image(offline_img, channels="BGR", width="stretch")
+    else:
+        with video_placeholder.container():
+            webrtc_ctx = webrtc_streamer(
+                key="driver-fatigue-webrtc",
+                video_processor_factory=WebRTCVideoProcessor,
+                rtc_configuration=RTCConfiguration(
+                    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+                ),
+                media_stream_constraints={"video": True, "audio": False},
+            )
+            if webrtc_ctx.video_processor:
+                webrtc_ctx.video_processor.raw_features_queue = st.session_state.raw_features_queue
 
     # If inactive, render default/last values
     if not st.session_state.session_active:
@@ -569,8 +591,8 @@ def run_app():
 
         # Loop until session deactivated
         while st.session_state.session_active:
-            # 1. Update Video Frame from queue
-            if st.session_state.video_queue is not None:
+            # 1. Update Video Frame from queue (Simulation Mode only)
+            if simulate and st.session_state.video_queue is not None:
                 try:
                     frame = st.session_state.video_queue.get_nowait()
                     video_placeholder.image(frame, channels="BGR", width="stretch")
@@ -602,16 +624,16 @@ def run_app():
                 render_placeholders(current_score, current_conf, current_alert, n_points)
 
             # 4. Check camera vs simulation status and update banner
-            if st.session_state.get('capture_thread') is not None:
+            if st.session_state.get('capture_thread') is not None or not simulate:
                 cap_thread = st.session_state.capture_thread
-                if cap_thread.simulate and not simulate:
+                if cap_thread is not None and cap_thread.simulate and not simulate:
                     status_banner_placeholder.markdown(
                         '<div class="connection-status" style="background: rgba(231, 76, 60, 0.1); border: 1px solid rgba(231, 76, 60, 0.3); color: #ff6b6b;">'
                         f'⚠️ CAMERA INITIALIZATION FAILED! Fell back to Simulation Mode (Camera ID: {camera_id})'
                         '</div>',
                         unsafe_allow_html=True
                     )
-                elif cap_thread.simulate:
+                elif simulate:
                     status_banner_placeholder.markdown(
                         '<div class="connection-status" style="background: rgba(241, 196, 15, 0.1); border: 1px solid rgba(241, 196, 15, 0.3); color: #f1c40f;">'
                         f'ℹ️ Running in Simulation Mode (Generating coherent driver sleepiness profiles)'
@@ -632,7 +654,7 @@ def run_app():
                             st.session_state.calibration_toast_shown = True
                         status_banner_placeholder.markdown(
                             '<div class="connection-status" style="background: rgba(46, 204, 113, 0.1); border: 1px solid rgba(46, 204, 113, 0.3); color: #2ecc71;">'
-                            f'🟢 Real-time Webcam Feed Active • Personalized Calibration Active (Camera ID: {camera_id})'
+                            f'🟢 Real-time WebRTC Webcam Active • Personalized Calibration Active'
                             '</div>',
                             unsafe_allow_html=True
                         )

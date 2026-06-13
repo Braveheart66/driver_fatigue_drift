@@ -14,6 +14,53 @@ from typing import Optional
 import numpy as np
 import torch
 
+try:
+    from streamlit_webrtc import VideoProcessorBase
+    import av
+    HAS_WEBRTC = True
+except ImportError:
+    VideoProcessorBase = object
+    av = None
+    HAS_WEBRTC = False
+
+
+class WebRTCVideoProcessor(VideoProcessorBase):
+    """Processes video frames from client WebRTC stream using FaceMeshExtractor."""
+
+    def __init__(self):
+        self.raw_features_queue = None
+        # Lazy load extractor inside the WebRTC thread to avoid locks
+        from src.extraction.face_mesh import FaceMeshExtractor
+        self.extractor = FaceMeshExtractor()
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        if av is None:
+            return frame
+        img = frame.to_ndarray(format="bgr24")
+
+        try:
+            features, annotated_frame = self.extractor.process_and_annotate(img)
+            if features is not None and self.raw_features_queue is not None:
+                try:
+                    self.raw_features_queue.put_nowait(features)
+                except queue.Full:
+                    pass
+            elif self.raw_features_queue is not None:
+                # Send fallback metrics when face detection is lost to maintain sequence continuity
+                try:
+                    fallback = {
+                        'ear': 0.30, 'mar': 0.10, 'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0,
+                        'au6': 0.1, 'au12': 0.12, 'gaze_x': 0.0, 'gaze_y': 0.0
+                    }
+                    self.raw_features_queue.put_nowait(fallback)
+                except queue.Full:
+                    pass
+        except Exception as e:
+            print(f"[WebRTCVideoProcessor] Frame processing error: {e}")
+            annotated_frame = img
+
+        return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
+
 
 class CaptureThread(threading.Thread):
     """Capture frames from webcam or generate synthetic ones for testing."""
@@ -81,7 +128,8 @@ class ExtractionThread(threading.Thread):
     def __init__(self, frame_queue: queue.Queue, feature_queue: queue.Queue,
                  stop_event: threading.Event, extractor=None,
                  user_baseline: dict = None, window_frames: int = 150,
-                 video_queue: queue.Queue = None, capture_thread=None):
+                 video_queue: queue.Queue = None, capture_thread=None,
+                 raw_features_queue: queue.Queue = None):
         super().__init__(daemon=True, name='ExtractionThread')
         self.frame_queue = frame_queue
         self.feature_queue = feature_queue
@@ -91,6 +139,7 @@ class ExtractionThread(threading.Thread):
         self.window_frames = window_frames
         self.video_queue = video_queue
         self.capture_thread = capture_thread
+        self.raw_features_queue = raw_features_queue
         self._frame_buffer = []
 
         # Simulation states
@@ -106,73 +155,88 @@ class ExtractionThread(threading.Thread):
     def run(self):
         import cv2
         while not self.stop_event.is_set():
-            try:
-                frame = self.frame_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            self.frame_count += 1
-
-            # Compute current sleepiness factor S(t) based on frame index
-            t = self.frame_count / 30.0
-            if t < 20:
-                s_t = 0.0
-            elif t < 80:
-                s_t = (t - 20) / 60.0 * 0.8
-            elif t < 120:
-                s_t = 0.8 + 0.15 * np.sin((t - 80) * 0.1)
-            elif t < 150:
-                s_t = max(0.1, 0.8 - (t - 120) / 30.0 * 0.7)
-            else:
-                s_t = 0.1
-
-            is_simulating = (self.extractor is None) or (self.capture_thread is not None and self.capture_thread.simulate)
-
-            # Extract and annotate
-            annotated_frame = None
-            if not is_simulating and self.extractor is not None:
+            features = None
+            if self.raw_features_queue is not None:
                 try:
-                    features, annotated_frame = self.extractor.process_and_annotate(frame)
-                    if features is None:
-                        features = self._dummy_features(s_t)
-                except Exception:
-                    features = self._dummy_features(s_t)
+                    features = self.raw_features_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
             else:
-                features = self._dummy_features(s_t)
+                try:
+                    frame = self.frame_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
 
-            if is_simulating or annotated_frame is None:
-                # Generate virtual BGR camera feed avatar for simulation
-                annotated_frame = np.zeros((480, 640, 3), dtype=np.uint8) + 40
-                
-                # Draw face circle
-                cv2.circle(annotated_frame, (320, 240), 120, (255, 255, 255), 2)
-                
-                ear = features.get('ear', 0.3)
-                mar = features.get('mar', 0.1)
-                
-                # Eyes
-                if ear < 0.22:
-                    cv2.line(annotated_frame, (265, 200), (295, 200), (0, 0, 255), 3)
-                    cv2.line(annotated_frame, (345, 200), (375, 200), (0, 0, 255), 3)
-                    cv2.putText(annotated_frame, "EYES CLOSED", (270, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                else:
-                    cv2.circle(annotated_frame, (280, 200), 15, (0, 255, 0), -1)
-                    cv2.circle(annotated_frame, (280, 200), 5, (0, 0, 0), -1)
-                    cv2.circle(annotated_frame, (360, 200), 15, (0, 255, 0), -1)
-                    cv2.circle(annotated_frame, (360, 200), 5, (0, 0, 0), -1)
-                    
-                # Mouth
-                if mar > 0.40:
-                    cv2.circle(annotated_frame, (320, 290), int(mar * 60), (0, 0, 255), -1)
-                    cv2.putText(annotated_frame, "YAWN DETECTED", (260, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                else:
-                    cv2.line(annotated_frame, (300, 290), (340, 290), (0, 255, 0), 3)
-                    
-                cv2.putText(annotated_frame, "SIMULATING WEB CAM FEED", (150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                cv2.putText(annotated_frame, f"EAR: {ear:.3f} | MAR: {mar:.3f}", (180, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                self.frame_count += 1
 
-            # Privacy: original frame is discarded immediately
-            del frame
+                # Compute current sleepiness factor S(t) based on frame index
+                t = self.frame_count / 30.0
+                if t < 20:
+                    s_t = 0.0
+                elif t < 80:
+                    s_t = (t - 20) / 60.0 * 0.8
+                elif t < 120:
+                    s_t = 0.8 + 0.15 * np.sin((t - 80) * 0.1)
+                elif t < 150:
+                    s_t = max(0.1, 0.8 - (t - 120) / 30.0 * 0.7)
+                else:
+                    s_t = 0.1
+
+                is_simulating = (self.extractor is None) or (self.capture_thread is not None and self.capture_thread.simulate)
+
+                # Extract and annotate
+                annotated_frame = None
+                if not is_simulating and self.extractor is not None:
+                    try:
+                        features, annotated_frame = self.extractor.process_and_annotate(frame)
+                        if features is None:
+                            features = self._dummy_features(s_t)
+                    except Exception:
+                        features = self._dummy_features(s_t)
+                else:
+                    features = self._dummy_features(s_t)
+
+                if is_simulating or annotated_frame is None:
+                    # Generate virtual BGR camera feed avatar for simulation
+                    annotated_frame = np.zeros((480, 640, 3), dtype=np.uint8) + 40
+                    
+                    # Draw face circle
+                    cv2.circle(annotated_frame, (320, 240), 120, (255, 255, 255), 2)
+                    
+                    ear = features.get('ear', 0.3)
+                    mar = features.get('mar', 0.1)
+                    
+                    # Eyes
+                    if ear < 0.22:
+                        cv2.line(annotated_frame, (265, 200), (295, 200), (0, 0, 255), 3)
+                        cv2.line(annotated_frame, (345, 200), (375, 200), (0, 0, 255), 3)
+                        cv2.putText(annotated_frame, "EYES CLOSED", (270, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    else:
+                        cv2.circle(annotated_frame, (280, 200), 15, (0, 255, 0), -1)
+                        cv2.circle(annotated_frame, (280, 200), 5, (0, 0, 0), -1)
+                        cv2.circle(annotated_frame, (360, 200), 15, (0, 255, 0), -1)
+                        cv2.circle(annotated_frame, (360, 200), 5, (0, 0, 0), -1)
+                        
+                    # Mouth
+                    if mar > 0.40:
+                        cv2.circle(annotated_frame, (320, 290), int(mar * 60), (0, 0, 255), -1)
+                        cv2.putText(annotated_frame, "YAWN DETECTED", (260, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    else:
+                        cv2.line(annotated_frame, (300, 290), (340, 290), (0, 255, 0), 3)
+                        
+                    cv2.putText(annotated_frame, "SIMULATING WEB CAM FEED", (150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    cv2.putText(annotated_frame, f"EAR: {ear:.3f} | MAR: {mar:.3f}", (180, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # Privacy: original frame is discarded immediately
+                del frame
+
+                # Put processed video frames in queue (resized to 320x240 for fast Streamlit UI rendering)
+                if self.video_queue is not None:
+                    try:
+                        resized = cv2.resize(annotated_frame, (320, 240))
+                        self.video_queue.put(resized, timeout=0.01)
+                    except (queue.Full, Exception):
+                        pass
 
             self._frame_buffer.append(features)
             self.ear_history.append(features.get('ear', 0.3))
@@ -181,14 +245,6 @@ class ExtractionThread(threading.Thread):
                 self.ear_history.pop(0)
             if len(self.mar_history) > 900:
                 self.mar_history.pop(0)
-
-            # Put processed video frames in queue (resized to 320x240 for fast Streamlit UI rendering)
-            if self.video_queue is not None:
-                try:
-                    resized = cv2.resize(annotated_frame, (320, 240))
-                    self.video_queue.put(resized, timeout=0.01)
-                except (queue.Full, Exception):
-                    pass
 
             if len(self._frame_buffer) >= self.window_frames:
                 window_vec = self._aggregate_window(self._frame_buffer[:self.window_frames])
@@ -671,7 +727,8 @@ class InferenceThread(threading.Thread):
 
 
 def start_pipeline(encoder=None, drift_model=None, cusum=None,
-                   simulate=True, camera_id=0, device='cpu', video_queue=None):
+                   simulate=True, camera_id=0, device='cpu', video_queue=None,
+                   webrtc_mode=False, raw_features_queue=None):
     """Start the threaded inference pipeline.
 
     Args:
@@ -682,9 +739,11 @@ def start_pipeline(encoder=None, drift_model=None, cusum=None,
         camera_id: OpenCV camera index.
         device: torch device string.
         video_queue: Queue to publish annotated frames to.
+        webrtc_mode: If True, bypass OpenCV camera capture and use WebRTC queues.
+        raw_features_queue: In WebRTC mode, the queue receiving raw client features.
 
     Returns:
-        Tuple of (stop_event, score_queue) for external consumers.
+        Tuple of (stop_event, score_queue, cap, ext, inf) for external consumers.
     """
     frame_q = queue.Queue(maxsize=30)
     feat_q = queue.Queue(maxsize=500)
@@ -692,17 +751,21 @@ def start_pipeline(encoder=None, drift_model=None, cusum=None,
     stop = threading.Event()
 
     extractor = None
-    if not simulate:
+    if not simulate and not webrtc_mode:
         from src.extraction.face_mesh import FaceMeshExtractor
         extractor = FaceMeshExtractor()
 
-    cap = CaptureThread(frame_q, stop, camera_id=camera_id, simulate=simulate)
-    ext = ExtractionThread(frame_q, feat_q, stop, extractor=extractor, video_queue=video_queue, capture_thread=cap)
+    cap = None
+    if not webrtc_mode:
+        cap = CaptureThread(frame_q, stop, camera_id=camera_id, simulate=simulate)
+        cap.start()
+
+    ext = ExtractionThread(frame_q, feat_q, stop, extractor=extractor, video_queue=video_queue,
+                           capture_thread=cap, raw_features_queue=raw_features_queue)
     inf = InferenceThread(feat_q, score_q, stop,
                           encoder=encoder, drift_model=drift_model,
                           cusum=cusum, device=device)
 
-    cap.start()
     ext.start()
     inf.start()
 
