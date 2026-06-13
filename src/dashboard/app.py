@@ -128,6 +128,7 @@ def run_app():
         st.session_state.video_queue = None
         st.session_state.capture_thread = None
         st.session_state.calibration_toast_shown = False
+        st.session_state.webrtc_key_suffix = 0
 
     # --- Sidebar ---
     with st.sidebar:
@@ -135,14 +136,20 @@ def run_app():
         st.markdown('---')
         user_id = st.text_input('User ID', value='user_001')
 
-        col_start, col_stop = st.columns(2)
-        start_btn = col_start.button('▶️ Start', use_container_width=True)
-        stop_btn = col_stop.button('⏹ Stop', use_container_width=True)
-
-        st.markdown('---')
         st.subheader('Settings')
         simulate = st.checkbox('Simulation Mode', value=False,
                                help='Generate synthetic data instead of webcam')
+        st.markdown('---')
+
+        col_start, col_stop = st.columns(2)
+        if simulate:
+            start_btn = col_start.button('▶️ Start', use_container_width=True)
+        else:
+            start_btn = False
+            col_start.info("Use webcam 'Start' on main screen")
+
+        stop_btn = col_stop.button('⏹ Stop', use_container_width=True)
+
         camera_id = st.number_input('Camera ID', min_value=0, max_value=5, value=0, step=1,
                                     help='OpenCV camera index (0 for built-in, 1+ for external)')
         refresh_rate = st.slider('Refresh (sec)', 1, 10, 3)
@@ -151,8 +158,8 @@ def run_app():
         st.caption('v1.0 • Fatigue Drift Monitor')
         st.caption('RTX 3050 Laptop GPU')
 
-    # --- Handle Start / Stop ---
-    if start_btn and not st.session_state.session_active:
+    # --- Handle Start / Stop (Simulation Mode Only) ---
+    if simulate and start_btn and not st.session_state.session_active:
         st.session_state.score_history = []
         st.session_state.time_history = []
         st.session_state.confidence_history = []
@@ -176,79 +183,38 @@ def run_app():
         
         from src.inference.realtime import start_pipeline
         from src.models.cusum import CUSUMDetector
+        from src.models.short_encoder import ShortTermEncoder
+        from src.models.drift_model import DriftModel
         
-        encoder = None
-        drift_model = None
-        if not simulate:
-            import torch
-            from pathlib import Path
-            from src.models.short_encoder import ShortTermEncoder
-            from src.models.drift_model import DriftModel
-            
-            # Find checkpoint
-            ckpt_files = list(Path('models').glob('*.ckpt'))
-            dmd_ckpts = [c for c in ckpt_files if 'dmd' in c.name]
-            if dmd_ckpts:
-                checkpoint_path = sorted(dmd_ckpts)[-1]
-            elif ckpt_files:
-                checkpoint_path = sorted(ckpt_files)[-1]
-            else:
-                checkpoint_path = None
-                
-            if checkpoint_path and Path(checkpoint_path).exists():
-                try:
-                    ckpt = torch.load(checkpoint_path, map_location='cpu')
-                    state_dict = ckpt.get('state_dict', ckpt)
-                    
-                    # Discover hyperparameters from state dict dynamically
-                    from scripts.export_onnx import discover_hyperparameters, clean_state_dict
-                    hparams = discover_hyperparameters(state_dict)
-                    encoder = ShortTermEncoder(
-                        input_dim=hparams['input_dim'],
-                        hidden_dim=hparams['hidden_dim'],
-                        num_layers=hparams['num_layers'],
-                        output_dim=hparams['output_dim']
-                    )
-                    prefix = "encoder."
-                    if not any(k.startswith(prefix) for k in state_dict.keys()):
-                        if any(k.startswith("model.encoder.") for k in state_dict.keys()):
-                            prefix = "model.encoder."
-                    cleaned_sd = clean_state_dict(state_dict, prefix=prefix)
-                    encoder.load_state_dict(cleaned_sd, strict=True)
-                    encoder.eval()
-                    st.toast(f"Loaded encoder from {checkpoint_path.name}! 🎯")
-                except Exception as e:
-                    st.warning(f"Error loading checkpoint weights: {e}. Falling back to default architecture.")
-                    encoder = ShortTermEncoder()
-            else:
-                st.warning("No checkpoint found. Running with uninitialized encoder.")
-                encoder = ShortTermEncoder()
-                
-            drift_model = DriftModel()
+        encoder = ShortTermEncoder()
+        drift_model = DriftModel()
             
         st.session_state.video_queue = queue.Queue(maxsize=10)
-        st.session_state.raw_features_queue = queue.Queue(maxsize=100) if not simulate else None
+        st.session_state.raw_features_queue = None
         
         stop_event, score_q, cap, ext, inf = start_pipeline(
-            simulate=simulate,
+            simulate=True,
             camera_id=int(camera_id),
             encoder=encoder,
             drift_model=drift_model,
             cusum=CUSUMDetector(),
-            video_queue=st.session_state.video_queue if simulate else None,
-            webrtc_mode=not simulate,
-            raw_features_queue=st.session_state.raw_features_queue
+            video_queue=st.session_state.video_queue,
+            webrtc_mode=False,
+            raw_features_queue=None
         )
         st.session_state.pipeline_stop = stop_event
         st.session_state.score_queue = score_q
         st.session_state.capture_thread = cap
-        st.toast('Session started! 🚀')
+        st.toast('Simulation session started! 🚀')
 
     if stop_btn and st.session_state.session_active:
         st.session_state.session_active = False
+        if not simulate:
+            st.session_state.webrtc_key_suffix += 1
         if st.session_state.pipeline_stop:
             st.session_state.pipeline_stop.set()
         st.toast('Session ended.')
+        st.rerun()
 
     # --- Main Title ---
     st.markdown(
@@ -467,18 +433,11 @@ def run_app():
     n_points = len(st.session_state.score_history)
 
     # Set offline webcam image or render active WebRTC streamer
-    if not st.session_state.session_active or simulate:
-        offline_img = np.zeros((240, 320, 3), dtype=np.uint8) + 20
-        import cv2
-        cv2.putText(offline_img, "CAMERA OFFLINE", (45, 115),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 110, 120), 2)
-        cv2.putText(offline_img, "Click Start to activate feed", (35, 145),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 90, 100), 1)
-        video_placeholder.image(offline_img, channels="BGR", width="stretch")
-    else:
+    webrtc_ctx = None
+    if not simulate:
         with video_placeholder.container():
             webrtc_ctx = webrtc_streamer(
-                key="driver-fatigue-webrtc",
+                key=f"driver-fatigue-webrtc-{st.session_state.webrtc_key_suffix}",
                 video_processor_factory=WebRTCVideoProcessor,
                 rtc_configuration=RTCConfiguration(
                     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -487,12 +446,118 @@ def run_app():
             )
             if webrtc_ctx.video_processor:
                 webrtc_ctx.video_processor.raw_features_queue = st.session_state.raw_features_queue
+    else:
+        if not st.session_state.session_active:
+            offline_img = np.zeros((240, 320, 3), dtype=np.uint8) + 20
+            import cv2
+            cv2.putText(offline_img, "CAMERA OFFLINE", (45, 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 110, 120), 2)
+            cv2.putText(offline_img, "Click Start in sidebar", (45, 145),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 90, 100), 1)
+            video_placeholder.image(offline_img, channels="BGR", width="stretch")
+
+    # --- Handle WebRTC Active Stream State Transitions ---
+    if webrtc_ctx is not None:
+        if webrtc_ctx.state.playing and not st.session_state.session_active:
+            st.session_state.score_history = []
+            st.session_state.time_history = []
+            st.session_state.confidence_history = []
+            st.session_state.alert_history = []
+            st.session_state.attributions_history = []
+            st.session_state.calibration_toast_shown = False
+            st.session_state.session_active = True
+            st.session_state.session_start = time.time()
+
+            import importlib
+            import src.models.cusum
+            import src.extraction.face_mesh
+            import src.explainability.attribution
+            import src.inference.realtime
+            
+            importlib.reload(src.models.cusum)
+            importlib.reload(src.extraction.face_mesh)
+            importlib.reload(src.explainability.attribution)
+            importlib.reload(src.inference.realtime)
+            
+            from src.inference.realtime import start_pipeline
+            from src.models.cusum import CUSUMDetector
+            
+            encoder = None
+            drift_model = None
+            import torch
+            from pathlib import Path
+            from src.models.short_encoder import ShortTermEncoder
+            from src.models.drift_model import DriftModel
+            
+            ckpt_files = list(Path('models').glob('*.ckpt'))
+            dmd_ckpts = [c for c in ckpt_files if 'dmd' in c.name]
+            if dmd_ckpts:
+                checkpoint_path = sorted(dmd_ckpts)[-1]
+            elif ckpt_files:
+                checkpoint_path = sorted(ckpt_files)[-1]
+            else:
+                checkpoint_path = None
+                
+            if checkpoint_path and Path(checkpoint_path).exists():
+                try:
+                    ckpt = torch.load(checkpoint_path, map_location='cpu')
+                    state_dict = ckpt.get('state_dict', ckpt)
+                    from scripts.export_onnx import discover_hyperparameters, clean_state_dict
+                    hparams = discover_hyperparameters(state_dict)
+                    encoder = ShortTermEncoder(
+                        input_dim=hparams['input_dim'],
+                        hidden_dim=hparams['hidden_dim'],
+                        num_layers=hparams['num_layers'],
+                        output_dim=hparams['output_dim']
+                    )
+                    prefix = "encoder."
+                    if not any(k.startswith(prefix) for k in state_dict.keys()):
+                        if any(k.startswith("model.encoder.") for k in state_dict.keys()):
+                            prefix = "model.encoder."
+                    cleaned_sd = clean_state_dict(state_dict, prefix=prefix)
+                    encoder.load_state_dict(cleaned_sd, strict=True)
+                    encoder.eval()
+                    st.toast(f"Loaded encoder from {checkpoint_path.name}! 🎯")
+                except Exception as e:
+                    st.warning(f"Error loading checkpoint weights: {e}. Falling back to default architecture.")
+                    encoder = ShortTermEncoder()
+            else:
+                st.warning("No checkpoint found. Running with uninitialized encoder.")
+                encoder = ShortTermEncoder()
+                
+            drift_model = DriftModel()
+            
+            st.session_state.video_queue = queue.Queue(maxsize=10)
+            st.session_state.raw_features_queue = queue.Queue(maxsize=100)
+            
+            stop_event, score_q, cap, ext, inf = start_pipeline(
+                simulate=False,
+                camera_id=int(camera_id),
+                encoder=encoder,
+                drift_model=drift_model,
+                cusum=CUSUMDetector(),
+                video_queue=None,
+                webrtc_mode=True,
+                raw_features_queue=st.session_state.raw_features_queue
+            )
+            st.session_state.pipeline_stop = stop_event
+            st.session_state.score_queue = score_q
+            st.session_state.capture_thread = cap
+            st.toast('Webcam session started! 🚀')
+            st.rerun()
+
+        elif not webrtc_ctx.state.playing and st.session_state.session_active:
+            st.session_state.session_active = False
+            if st.session_state.pipeline_stop:
+                st.session_state.pipeline_stop.set()
+            st.toast('Session ended.')
+            st.rerun()
 
     # If inactive, render default/last values
     if not st.session_state.session_active:
         status_banner_placeholder.markdown(
             '<div class="connection-status" style="background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); color: #8a9ba8;">'
-            '🔴 System Offline • Click Start in sidebar to begin monitoring'
+            '🔴 System Offline • Click Start in sidebar (Simulation) or start webcam feed to begin monitoring'
             '</div>',
             unsafe_allow_html=True
         )
